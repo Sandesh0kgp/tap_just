@@ -1,0 +1,10 @@
+streamlit==1.38.0
+pandas==2.2.2
+langchain==0.3.0
+langchain-community==0.3.0
+langchain-groq==0.2.0
+faiss-cpu==1.8.0
+sentence-transformers==3.1.1
+gdown==5.2.0
+requests==2.32.3
+beautifulsoup4==4.12.3
