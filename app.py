@@ -3,7 +3,6 @@ import pandas as pd
 from langchain_groq import ChatGroq
 from langchain.prompts import PromptTemplate
 from langchain_community.document_loaders import CSVLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -11,8 +10,9 @@ import tempfile
 import os
 import gdown
 import logging
+import requests
 
-# Configure minimal logging
+# Configure logging
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ if "data_status" not in st.session_state:
     }
 
 # Initialize embeddings
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+embeddings = HuggingFaceEmbeddings(model_name="multi-qa-MiniLM-L6-cos-v1")
 
 def get_file_id_from_url(url):
     """Extract file ID from Google Drive URL"""
@@ -50,47 +50,99 @@ def get_file_id_from_url(url):
     except Exception:
         return None
 
+def check_file_accessibility(url):
+    """Check if Google Drive file is publicly accessible"""
+    file_id = get_file_id_from_url(url)
+    if not file_id:
+        return False, "Invalid URL format"
+    try:
+        response = requests.head(f"https://drive.google.com/uc?id={file_id}", allow_redirects=True)
+        return response.status_code == 200, "Accessible" if response.status_code == 200 else "Not publicly accessible"
+    except Exception as e:
+        return False, f"Access check failed: {str(e)}"
+
 def load_csv_from_drive(url, doc_type):
-    """Load CSV from Google Drive and return documents using CSVLoader"""
+    """Load CSV from Google Drive with fallback to pandas"""
     file_id = get_file_id_from_url(url)
     if not file_id:
         return None, f"Invalid URL: {url}"
     
+    # Check accessibility
+    is_accessible, access_message = check_file_accessibility(url)
+    if not is_accessible:
+        return None, access_message
+    
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as temp_file:
             temp_path = temp_file.name
-        download_url = f'https://drive.google.com/uc?id={file_id}'
+        download_url = f'https://drive.google.com/uc?id={file_id}&export=download'
         gdown.download(download_url, temp_path, quiet=True)
         
-        if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+            return None, "Downloaded file is empty"
+        
+        # Try CSVLoader first
+        try:
             loader = CSVLoader(
                 file_path=temp_path,
-                csv_args={"delimiter": ","},
+                csv_args={"delimiter": ",", "encoding": "utf-8"},
                 metadata_columns=["isin", "company_name"] if doc_type != "company" else ["company_name"]
             )
             documents = loader.load()
-            os.unlink(temp_path)
-            
             if not documents:
-                return None, "CSV file is empty"
+                raise ValueError("CSVLoader returned empty documents")
             
             # Add doc_type to metadata
             for doc in documents:
                 doc.metadata["doc_type"] = doc_type
             
-            # Validate data
+            # Validate bond data
             if doc_type == "bond":
-                coupon_rates = [float(doc.page_content.split("coupon_rate:")[1].split("\n")[0]) 
-                               for doc in documents if "coupon_rate:" in doc.page_content]
+                coupon_rates = []
+                security_types = []
+                for doc in documents:
+                    content = doc.page_content
+                    if "coupon_rate:" in content:
+                        try:
+                            rate = float(content.split("coupon_rate:")[1].split("\n")[0].strip())
+                            coupon_rates.append(rate)
+                        except (ValueError, IndexError):
+                            continue
+                    if "security_type:" in content:
+                        security_types.append(content.split("security_type:")[1].split("\n")[0].strip().lower())
+                
                 if coupon_rates and all(rate == 0 for rate in coupon_rates):
                     st.warning("Warning: All coupon rates are 0. Filter queries may return no results.")
-                security_types = [doc.page_content.split("security_type:")[1].split("\n")[0].lower() 
-                                 for doc in documents if "security_type:" in doc.page_content]
                 if security_types and all(st == "n/a" for st in security_types):
                     st.warning("Warning: All security types are 'N/A'. Secured bond queries may fail.")
             
+            os.unlink(temp_path)
             return documents, f"Loaded {len(documents)} {doc_type} records"
-        return None, "Downloaded file is empty"
+        
+        except Exception as e:
+            logger.warning(f"CSVLoader failed: {str(e)}. Falling back to pandas.")
+            # Fallback to pandas
+            try:
+                df = pd.read_csv(temp_path, encoding="utf-8")
+                if df.empty:
+                    raise ValueError("Pandas loaded empty DataFrame")
+                
+                documents = []
+                for _, row in df.iterrows():
+                    content = "\n".join(f"{col}: {row.get(col, 'N/A')}" for col in df.columns)
+                    metadata = {
+                        "doc_type": doc_type,
+                        "isin": str(row.get("isin", "N/A")) if "isin" in df.columns else "N/A",
+                        "company_name": str(row.get("company_name", "N/A")) if "company_name" in df.columns else "N/A"
+                    }
+                    documents.append(Document(page_content=content, metadata=metadata))
+                
+                os.unlink(temp_path)
+                return documents, f"Loaded {len(documents)} {doc_type} records (via pandas fallback)"
+            
+            except Exception as e:
+                raise Exception(f"Pandas fallback failed: {str(e)}")
+    
     except Exception as e:
         try:
             if 'temp_path' in locals():
@@ -147,13 +199,8 @@ def load_all_data(bond_urls, cashflow_url, company_url):
             status["company"]["status"] = "error"
             status["company"]["message"] = message
     
-    # Split documents
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
-    )
-    split_documents = text_splitter.split_documents(all_documents)
+    # Use custom CSV row splitter (no splitting, each row is a chunk)
+    split_documents = all_documents  # Pass documents as-is, no further splitting
     
     # Create vector store
     if split_documents:
@@ -179,25 +226,27 @@ def get_llm(api_key, model_option, temperature, max_tokens):
 def create_rag_chain(vector_store, llm):
     """Create RAG prompt and chain"""
     prompt_template = """
-    You are a financial assistant specializing in bonds. Use the provided context to answer the query in a professional, friendly manner with Markdown formatting. Structure responses as tables for lists of bonds or cashflows, and use text for single bond details or company metrics. If the context is insufficient or data is missing (e.g., coupon_rate is 0 or security_type is N/A), provide a clear error message suggesting the user check the CSV files.
+    You are a financial assistant specializing in bonds. Use the provided context to answer the query in a professional, friendly manner with Markdown formatting. Structure responses as tables for lists of bonds or cashflows, and use text for single bond details or company metrics. If the context lacks bond data or the query cannot be answered (e.g., missing ISIN, invalid data), return a clear error message: "**Error**: Bond data not loaded or ISIN not found. Please check the CSV files in the sidebar and ensure they are publicly accessible."
 
     **User Query**: {question}
     **Context**: {context}
 
     **Instructions**:
-    - For ISIN lookups (e.g., "Show details for INE123456789"), return a single bond's details in a formatted text block.
-    - For company issuances (e.g., "Show all issuances by Ugro Capital"), return a table of bonds.
+    - For ISIN lookups (e.g., "Show details for INE123456789"), return details for the exact ISIN from bond documents. If no matching ISIN is found, return an error.
+    - For company issuances (e.g., "Show all issuances by Ugro Capital"), return a table of bonds for the company.
     - For filter searches (e.g., "Find secured debentures with a coupon rate above 5%"), return a table of matching bonds, filtering by coupon_rate and security_type.
-    - For cashflow queries (e.g., "Cash flow for INE123456789"), return a table of cashflow dates and types.
-    - For company metrics (e.g., "What is the EPS of ABC company?"), return the requested metric (e.g., EPS, rating).
-    - For bond finder queries (e.g., "List bonds with a yield of more than 9%"), return a table of bonds with yields above the threshold (use mock data if needed).
-    - If no data matches, return: "**Error**: No results found. Please check if the CSV files contain valid coupon_rate or security_type values."
-    - Always format tables with columns aligned and include up to 5 rows for brevity.
+    - For cashflow queries (e.g., "Cash flow for INE123456789"), return a table of cashflow dates and types from cashflow documents.
+    - For company metrics (e.g., "What is the EPS of ABC company?"), return the requested metric from company documents.
+    - For bond finder queries (e.g., "List bonds with a yield of more than 9%"), return a table of bonds with yields above the threshold (use context data only, no mock data).
+    - If no bond documents are in the context, return: "**Error**: Bond data not loaded. Please check the CSV files in the sidebar and ensure they are publicly accessible."
+    - Never fabricate bond details or ISINs. If data is missing, admit it.
+    - Format tables with aligned columns and show up to 5 rows.
+    - Always include a header: "## Response".
 
     **Output Format**:
-    - Use Markdown tables for lists (e.g., | ISIN | Issuer | Coupon Rate | ... |).
-    - Use bullet points or text for single records.
-    - Include a header like "## Response" for clarity.
+    - Tables: | ISIN | Issuer | Coupon Rate | ... |
+    - Single record: Bullet points (e.g., - ISIN: INE123456789)
+    - Errors: **Error**: [message]
     """
     prompt = PromptTemplate(
         template=prompt_template,
@@ -206,6 +255,8 @@ def create_rag_chain(vector_store, llm):
     
     def format_context(documents):
         """Format retrieved documents into context string"""
+        if not documents:
+            return "No bond or cashflow data loaded."
         context = ""
         for doc in documents:
             context += f"Document Type: {doc.metadata.get('doc_type', 'unknown')}\n"
@@ -215,19 +266,28 @@ def create_rag_chain(vector_store, llm):
     
     def rag_chain(query):
         """Run RAG pipeline"""
+        # Check if bond data is loaded
+        bond_docs = vector_store.similarity_search("dummy", k=1, filter={"doc_type": "bond"})
+        if not bond_docs:
+            return "**Error**: Bond data not loaded. Please check the CSV files in the sidebar and ensure they are publicly accessible."
+        
         # Retrieve relevant documents
         retriever = vector_store.as_retriever(
             search_type="mmr",
-            search_kwargs={"k": 10, "fetch_k": 50}
+            search_kwargs={"k": 10, "fetch_k": 50, "filter": {"doc_type": ["bond", "cashflow", "company"]}}
         )
         docs = retriever.invoke(query)
         
-        # Filter by metadata if ISIN or company_name is in query
+        # Filter by ISIN for ISIN-specific queries
         if "INE" in query.upper():
             isin = next((word for word in query.split() if word.upper().startswith("INE") and len(word) >= 10), None)
             if isin:
-                docs = [doc for doc in docs if doc.metadata.get("isin") == isin]
-        elif "by" in query.lower():
+                docs = [doc for doc in docs if doc.metadata.get("isin") == isin and doc.metadata.get("doc_type") == "bond"]
+                if not docs:
+                    return f"**Error**: ISIN {isin} not found in bond data. Please check the CSV files."
+        
+        # Filter by company name for company-specific queries
+        if "by" in query.lower():
             company_name = query.lower().split("by")[-1].strip()
             docs = [doc for doc in docs if company_name.lower() in doc.metadata.get("company_name", "").lower()]
         
@@ -274,11 +334,19 @@ def main():
                 if st.session_state.vector_store:
                     st.success("Data loaded successfully!")
                 else:
-                    st.error("Failed to load data. Check Debug Information.")
+                    st.error("Failed to load bond or cashflow data. Check Debug Information for details.")
+        
+        if st.button("Retry Failed Loads"):
+            with st.spinner("Retrying failed loads..."):
+                st.session_state.data_status = load_all_data(bond_urls, cashflow_url, company_url)
+                if st.session_state.vector_store:
+                    st.success("Retry successful!")
+                else:
+                    st.error("Retry failed. Check Debug Information.")
         
         st.markdown("### Model Configuration")
         model_option = st.selectbox("Select Model", ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"])
-        temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
+        temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.1, step=0.1)
         max_tokens = st.slider("Max Tokens", min_value=500, max_value=4000, value=1500, step=500)
     
     # Main content
@@ -289,7 +357,7 @@ def main():
     Ask about bonds, companies, cash flows, yields, or search for bonds.
 
     **Example queries:**
-    - "Show details for INE123456789"
+    - "Show details for INE002A08542"
     - "Show all issuances by Ugro Capital"
     - "Find secured debentures with a coupon rate above 10%"
     - "What is the EPS of ABC company?"
@@ -335,7 +403,9 @@ def main():
                     response = f"**Error**: Failed to process query: {str(e)}"
                     st.session_state.chat_history.append({"role": "assistant", "content": response})
         else:
-            st.error("Please enter a valid GROQ API key and load data.")
+            response = "**Error**: Please enter a valid GROQ API key and ensure bond data is loaded."
+            st.session_state.chat_history.append({"role": "user", "content": query})
+            st.session_state.chat_history.append({"role": "assistant", "content": response})
 
     # Display chat history
     st.markdown("### Conversation")
@@ -350,7 +420,7 @@ def main():
     st.markdown("Powered by Tap Bonds AI")
 
     # Debug information
-    with st.expander("Debug Information", expanded=False):
+    with st.expander("Debug Information", expanded=True):
         st.write("Data Availability:")
         for key, status in st.session_state.data_status.items():
             st.write(f"- {key.capitalize()} Data: {display_status_indicator(status['status'])} {status['message']}")
@@ -358,6 +428,12 @@ def main():
         if st.checkbox("Show Vector Store Stats"):
             if st.session_state.vector_store:
                 st.write(f"Vector Store: {len(st.session_state.vector_store.index_to_docstore_id)} documents indexed")
+                bond_count = len(st.session_state.vector_store.similarity_search("dummy", k=1, filter={"doc_type": "bond"}))
+                cashflow_count = len(st.session_state.vector_store.similarity_search("dummy", k=1, filter={"doc_type": "cashflow"}))
+                company_count = len(st.session_state.vector_store.similarity_search("dummy", k=1, filter={"doc_type": "company"}))
+                st.write(f"- Bond Documents: {bond_count}")
+                st.write(f"- Cashflow Documents: {cashflow_count}")
+                st.write(f"- Company Documents: {company_count}")
 
 if __name__ == "__main__":
     main()
